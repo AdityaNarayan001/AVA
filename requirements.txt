@@ -1,0 +1,26 @@
+# Audio I/O
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.23.0
+scipy>=1.10.0
+
+# VAD - TEN VAD (primary) + Silero (fallback)
+# ten-vad installed separately via setup.sh from git
+torch>=2.0.0
+torchaudio>=2.0.0
+silero-vad>=5.1
+
+# STT - faster-whisper (tiny model, CTranslate2 backend)
+faster-whisper>=1.0.0
+
+# LLM - Ollama Python client
+ollama>=0.4.0
+
+# TTS - Kokoro ONNX (lightweight)
+kokoro-onnx>=0.4.0
+onnxruntime>=1.17.0
+
+# UI
+gradio>=4.0.0
+
+# Utilities
