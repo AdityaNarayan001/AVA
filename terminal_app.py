@@ -191,7 +191,12 @@ class AVATerminal:
 
     def _process_audio(self, audio: np.ndarray):
         try:
-            output = self.pipeline.process_utterance(audio)
+            def _play_chunk(tts_result):
+                """Play each sentence immediately as it's synthesized."""
+                self.status, self.status_detail = "SPEAKING", "Playing response..."
+                _safe_play(tts_result.audio, tts_result.sample_rate)
+
+            output = self.pipeline.process_utterance(audio, on_tts_chunk=_play_chunk)
             self.last_output = output
             self.last_metrics = output.metrics
 
@@ -203,11 +208,6 @@ class AVATerminal:
                 if assistant_text:
                     self.conversation.append(("ava", assistant_text))
                 self.turn_count += 1
-
-            # Play TTS
-            if output.tts_result and output.tts_result.audio is not None:
-                self.status, self.status_detail = "SPEAKING", "Playing response..."
-                _safe_play(output.tts_result.audio, output.tts_result.sample_rate)
 
             self.status, self.status_detail = "READY", "Hold SPACE to speak"
 
@@ -356,10 +356,17 @@ class AVATerminal:
         t1.append("  ▏  ", style="dim")
         t1.append("TTS ", style="bold green")
         t1.append(f"{m.tts_latency_ms:.0f}ms")
+        if m.tts_sentences > 1:
+            t1.append(f" ({m.tts_sentences}ch)", style="dim green")
         t1.append("  ▏  ", style="dim")
         t1.append("E2E ", style="bold")
         e2e_c = self._color_for(m.total_latency_ms, 2000, 4000)
         t1.append(f"{m.total_latency_ms:.0f}ms", style=f"bold {e2e_c}")
+        if m.time_to_first_audio_ms > 0:
+            ttfa_c = self._color_for(m.time_to_first_audio_ms, 1500, 3000)
+            t1.append("  ▏  ", style="dim")
+            t1.append("⚡1st ", style="bold yellow")
+            t1.append(f"{m.time_to_first_audio_ms:.0f}ms", style=f"bold {ttfa_c}")
         grid.add_row(t1)
 
         # Row 2: detail metrics

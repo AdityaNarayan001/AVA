@@ -35,12 +35,15 @@ try:
 except Exception:
     _OUTPUT_DEVICE_RATE = 48000
 
+# Pre-compute resampling ratio (avoids GCD calc on every playback)
+_RESAMPLE_UP = _OUTPUT_DEVICE_RATE // gcd(TTS_SAMPLE_RATE, _OUTPUT_DEVICE_RATE)
+_RESAMPLE_DOWN = TTS_SAMPLE_RATE // gcd(TTS_SAMPLE_RATE, _OUTPUT_DEVICE_RATE)
+
 
 def _safe_play(audio: np.ndarray, samplerate: int):
     """Play audio, resampling to the device's native rate if needed."""
     if samplerate != _OUTPUT_DEVICE_RATE:
-        g = gcd(samplerate, _OUTPUT_DEVICE_RATE)
-        audio = resample_poly(audio, _OUTPUT_DEVICE_RATE // g, samplerate // g).astype(np.float32)
+        audio = resample_poly(audio, _RESAMPLE_UP, _RESAMPLE_DOWN).astype(np.float32)
         samplerate = _OUTPUT_DEVICE_RATE
     sd.play(audio, samplerate=samplerate)
     sd.wait()
@@ -124,26 +127,28 @@ class VoicePipeline:
 
     def initialize(self):
         """Load all models. Call once before processing."""
+        from concurrent.futures import ThreadPoolExecutor
+
         logger.info("Initializing pipeline components...")
         t0 = time.perf_counter()
 
-        # VAD
+        # VAD loads instantly (C library)
         self._set_status("loading_vad")
         self.vad = VADProcessor(hop_size=VAD_FRAME_SAMPLES, threshold=self.vad_threshold)
 
-        # STT
-        self._set_status("loading_stt")
-        self.stt = STTEngine(model_size="tiny", device="cpu", compute_type="int8")
-        self.stt.load()
-
-        # LLM
-        self._set_status("loading_llm")
+        # LLM client is lightweight (just socket setup)
         self.llm = LLMEngine()
 
-        # TTS
-        self._set_status("loading_tts")
+        # STT and TTS model loads are independent — run in parallel
+        self._set_status("loading_models")
+        self.stt = STTEngine(model_size="tiny", device="cpu", compute_type="int8")
         self.tts = TTSEngine()
-        self.tts.load()
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ava-load") as pool:
+            stt_future = pool.submit(self.stt.load)
+            tts_future = pool.submit(self.tts.load)
+            stt_future.result()  # wait for both
+            tts_future.result()
 
         total_ms = (time.perf_counter() - t0) * 1000
         logger.info(f"Pipeline initialized in {total_ms:.0f}ms")
@@ -222,17 +227,28 @@ class VoicePipeline:
         last_vad = vad_result if len(audio_chunk) >= VAD_FRAME_SAMPLES else None
         return last_vad, completed_audio
 
-    def process_utterance(self, speech_audio: np.ndarray) -> PipelineOutput:
+    def process_utterance(
+        self,
+        speech_audio: np.ndarray,
+        on_tts_chunk: Optional[Callable[[TTSResult], None]] = None,
+    ) -> PipelineOutput:
         """
-        Process a complete utterance through STT → LLM → TTS.
-        
+        Process a complete utterance through STT → LLM (streaming) → TTS (sentence-chunked).
+
+        Uses the LLM streaming API to detect sentence boundaries and starts TTS
+        synthesis on the first complete sentence while the LLM is still generating.
+        If `on_tts_chunk` is provided, each synthesized sentence is passed to it
+        immediately (typically for playback), enabling overlapped audio.
+
         Args:
             speech_audio: int16 numpy array at 16kHz containing the speech
-            
+            on_tts_chunk: Optional callback receiving each TTSResult chunk for playback
+
         Returns:
-            PipelineOutput with results from each stage and metrics
+            PipelineOutput with aggregated results and metrics
         """
         self._processing = True
+        pipeline_t0 = time.perf_counter()
         metrics = PipelineMetrics()
         metrics.speech_duration_ms = len(speech_audio) / SAMPLE_RATE * 1000
         metrics.vad_backend = self.vad.backend_name if self.vad else "unknown"
@@ -257,9 +273,31 @@ class VoicePipeline:
                 self._processing = False
                 return output
 
-            # ---- LLM ----
+            # ---- LLM (streaming) → TTS (sentence-chunked) ----
             self._set_status("thinking")
-            llm_result = self.llm.generate(self.memory, stt_result.text)
+
+            tts_chunks: list[TTSResult] = []
+            total_tts_ms = 0.0
+            first_audio_time: Optional[float] = None
+
+            def _on_sentence(sentence: str):
+                """Called by LLM streamer for each complete sentence."""
+                nonlocal total_tts_ms, first_audio_time
+
+                self._set_status("speaking")
+                tts_result = self.tts.synthesize(sentence)
+                tts_chunks.append(tts_result)
+                total_tts_ms += tts_result.processing_time_ms
+
+                if first_audio_time is None:
+                    first_audio_time = time.perf_counter()
+
+                if on_tts_chunk is not None:
+                    on_tts_chunk(tts_result)
+
+            llm_result = self.llm.generate_stream(
+                self.memory, stt_result.text, on_sentence=_on_sentence,
+            )
             output.llm_result = llm_result
 
             metrics.llm_latency_ms = llm_result.processing_time_ms
@@ -271,21 +309,32 @@ class VoicePipeline:
             metrics.context_tokens_used = llm_result.context_tokens_used
             metrics.turns_in_context = llm_result.turns_in_context
 
-            if not llm_result.text.strip():
-                logger.info("LLM returned empty response, skipping TTS")
-                self._set_status("listening")
-                self._processing = False
-                return output
+            # ---- Aggregate TTS results ----
+            if tts_chunks:
+                # Concatenate all audio chunks into one result for callers
+                # that still read output.tts_result (e.g., Gradio UI state)
+                all_audio = np.concatenate([c.audio for c in tts_chunks])
+                total_audio_dur = sum(c.audio_duration_seconds for c in tts_chunks)
+                agg_tts = TTSResult(
+                    audio=all_audio,
+                    processing_time_ms=total_tts_ms,
+                    audio_duration_seconds=total_audio_dur,
+                    realtime_factor=total_audio_dur / (total_tts_ms / 1000) if total_tts_ms > 0 else 0,
+                    voice_name=tts_chunks[0].voice_name,
+                    sample_rate=tts_chunks[0].sample_rate,
+                    text_length=len(llm_result.text),
+                )
+                output.tts_result = agg_tts
 
-            # ---- TTS ----
-            self._set_status("speaking")
-            tts_result = self.tts.synthesize(llm_result.text)
-            output.tts_result = tts_result
+                metrics.tts_latency_ms = total_tts_ms
+                metrics.tts_audio_duration_ms = total_audio_dur * 1000
+                metrics.tts_realtime_factor = agg_tts.realtime_factor
+                metrics.tts_voice = agg_tts.voice_name
+                metrics.tts_sentences = len(tts_chunks)
 
-            metrics.tts_latency_ms = tts_result.processing_time_ms
-            metrics.tts_audio_duration_ms = tts_result.audio_duration_seconds * 1000
-            metrics.tts_realtime_factor = tts_result.realtime_factor
-            metrics.tts_voice = tts_result.voice_name
+            # Time to first audio = time from pipeline start to first TTS chunk ready
+            if first_audio_time is not None:
+                metrics.time_to_first_audio_ms = (first_audio_time - pipeline_t0) * 1000
 
             # Compute total
             metrics.compute_total()
@@ -428,7 +477,7 @@ class VoicePipeline:
     def _processing_loop(self):
         """
         Background thread: picks completed utterances from queue,
-        runs STT → LLM → TTS, plays audio, updates shared UI state.
+        runs STT → LLM (streaming) → TTS (sentence-chunked), plays audio.
         """
         logger.info("Processing loop started")
         while self._running:
@@ -440,21 +489,21 @@ class VoicePipeline:
             if speech_audio is None:
                 break  # Shutdown signal
 
-            # Process the utterance
-            output = self.process_utterance(speech_audio)
+            def _play_chunk(tts_result: TTSResult):
+                """Play each TTS sentence immediately as it's synthesized."""
+                self._playing = True
+                try:
+                    _safe_play(tts_result.audio, tts_result.sample_rate)
+                except Exception as e:
+                    logger.error(f"Audio playback error: {e}")
+
+            # Process with streaming — audio plays inside _play_chunk
+            output = self.process_utterance(speech_audio, on_tts_chunk=_play_chunk)
+            self._playing = False
             self._last_output = output
 
             # Update shared UI state
             self._update_ui_state(output)
-
-            # Play TTS audio through speaker (blocking)
-            if output.tts_result and output.tts_result.audio is not None:
-                self._playing = True
-                try:
-                    _safe_play(output.tts_result.audio, output.tts_result.sample_rate)
-                except Exception as e:
-                    logger.error(f"Audio playback error: {e}")
-                self._playing = False
 
             if self._running:
                 self._set_status("listening")
@@ -557,9 +606,10 @@ class VoicePipeline:
     def process_text_input(self, text: str) -> PipelineOutput:
         """
         Process a text input directly (skip mic/VAD/STT).
-        Useful for typing in the UI.
+        Uses streaming LLM + sentence-chunked TTS, same as voice path.
         """
         self._processing = True
+        pipeline_t0 = time.perf_counter()
         metrics = PipelineMetrics()
         metrics.stt_text = text
         metrics.stt_latency_ms = 0
@@ -571,9 +621,24 @@ class VoicePipeline:
         output = PipelineOutput(metrics=metrics)
 
         try:
-            # LLM
             self._set_status("thinking")
-            llm_result = self.llm.generate(self.memory, text)
+
+            tts_chunks: list[TTSResult] = []
+            total_tts_ms = 0.0
+            first_audio_time: Optional[float] = None
+
+            def _on_sentence(sentence: str):
+                nonlocal total_tts_ms, first_audio_time
+                self._set_status("speaking")
+                tts_result = self.tts.synthesize(sentence)
+                tts_chunks.append(tts_result)
+                total_tts_ms += tts_result.processing_time_ms
+                if first_audio_time is None:
+                    first_audio_time = time.perf_counter()
+
+            llm_result = self.llm.generate_stream(
+                self.memory, text, on_sentence=_on_sentence,
+            )
             output.llm_result = llm_result
 
             metrics.llm_latency_ms = llm_result.processing_time_ms
@@ -585,16 +650,28 @@ class VoicePipeline:
             metrics.context_tokens_used = llm_result.context_tokens_used
             metrics.turns_in_context = llm_result.turns_in_context
 
-            if llm_result.text.strip():
-                # TTS
-                self._set_status("speaking")
-                tts_result = self.tts.synthesize(llm_result.text)
-                output.tts_result = tts_result
+            if tts_chunks:
+                all_audio = np.concatenate([c.audio for c in tts_chunks])
+                total_audio_dur = sum(c.audio_duration_seconds for c in tts_chunks)
+                agg_tts = TTSResult(
+                    audio=all_audio,
+                    processing_time_ms=total_tts_ms,
+                    audio_duration_seconds=total_audio_dur,
+                    realtime_factor=total_audio_dur / (total_tts_ms / 1000) if total_tts_ms > 0 else 0,
+                    voice_name=tts_chunks[0].voice_name,
+                    sample_rate=tts_chunks[0].sample_rate,
+                    text_length=len(llm_result.text),
+                )
+                output.tts_result = agg_tts
 
-                metrics.tts_latency_ms = tts_result.processing_time_ms
-                metrics.tts_audio_duration_ms = tts_result.audio_duration_seconds * 1000
-                metrics.tts_realtime_factor = tts_result.realtime_factor
-                metrics.tts_voice = tts_result.voice_name
+                metrics.tts_latency_ms = total_tts_ms
+                metrics.tts_audio_duration_ms = total_audio_dur * 1000
+                metrics.tts_realtime_factor = agg_tts.realtime_factor
+                metrics.tts_voice = agg_tts.voice_name
+                metrics.tts_sentences = len(tts_chunks)
+
+            if first_audio_time is not None:
+                metrics.time_to_first_audio_ms = (first_audio_time - pipeline_t0) * 1000
 
             metrics.compute_total()
             self.session_metrics.add_turn(metrics)

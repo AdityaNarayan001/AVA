@@ -5,8 +5,6 @@ Uses faster-whisper with the tiny model for minimal latency.
 
 import numpy as np
 import time
-import tempfile
-import soundfile as sf
 from dataclasses import dataclass, field
 from typing import List, Optional
 import logging
@@ -115,36 +113,32 @@ class STTEngine:
                 segments=[],
             )
 
-        # Write to temp WAV for faster-whisper
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            sf.write(tmp.name, audio_float, sample_rate)
+        # Pass numpy array directly to faster-whisper (no temp file I/O)
+        t0 = time.perf_counter()
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            segments_iter, info = self.model.transcribe(
+                audio_float,
+                beam_size=1,  # greedy for speed
+                best_of=1,
+                language="en",  # force English for speed (skip detection)
+                vad_filter=False,  # we already did VAD
+                without_timestamps=False,
+            )
 
-            # Transcribe with timing (suppress mel-spectrogram edge-case warnings)
-            t0 = time.perf_counter()
-            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-                segments_iter, info = self.model.transcribe(
-                    tmp.name,
-                    beam_size=1,  # greedy for speed
-                    best_of=1,
-                    language="en",  # force English for speed (skip detection)
-                    vad_filter=False,  # we already did VAD
-                    without_timestamps=False,
-                )
+            # Collect segments (iterator is lazy, so keep inside errstate)
+            segments = []
+            full_text_parts = []
+            for seg in segments_iter:
+                segments.append(STTSegment(
+                    text=seg.text.strip(),
+                    start=seg.start,
+                    end=seg.end,
+                    avg_logprob=seg.avg_logprob,
+                    no_speech_prob=seg.no_speech_prob,
+                ))
+                full_text_parts.append(seg.text.strip())
 
-                # Collect segments (iterator is lazy, so keep inside errstate)
-                segments = []
-                full_text_parts = []
-                for seg in segments_iter:
-                    segments.append(STTSegment(
-                        text=seg.text.strip(),
-                        start=seg.start,
-                        end=seg.end,
-                        avg_logprob=seg.avg_logprob,
-                        no_speech_prob=seg.no_speech_prob,
-                    ))
-                    full_text_parts.append(seg.text.strip())
-
-            processing_time_ms = (time.perf_counter() - t0) * 1000
+        processing_time_ms = (time.perf_counter() - t0) * 1000
 
         full_text = " ".join(full_text_parts).strip()
 

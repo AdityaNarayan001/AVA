@@ -5,13 +5,19 @@ Integrates with ConversationMemory for multi-turn context.
 """
 
 import time
+import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable, Generator
 import logging
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "smollm2:135m"
+
+# Sentence boundary: punctuation that ends a sentence, followed by space or end-of-string.
+# Avoids splitting on common abbreviations.
+_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+_MIN_SENTENCE_CHARS = 12  # don't flush very short fragments
 
 
 @dataclass
@@ -71,6 +77,7 @@ class LLMEngine:
             response = self._client.chat(
                 model=self.model,
                 messages=messages,
+                keep_alive="10m",  # keep model hot in RAM between turns
             )
         except Exception as e:
             logger.error(f"Ollama error: {e}")
@@ -116,6 +123,113 @@ class LLMEngine:
             f"{processing_time_ms:.0f}ms | "
             f"{eval_count} tokens @ {tokens_per_second:.1f} tok/s | "
             f"context: {context_info['turns_in_context']} turns"
+        )
+        return result
+
+    def generate_stream(
+        self,
+        memory,
+        user_text: str,
+        on_sentence: Optional[Callable[[str], None]] = None,
+    ) -> LLMResult:
+        """
+        Stream tokens from the LLM. Calls `on_sentence(sentence_text)` each time
+        a complete sentence is detected, enabling overlapped TTS synthesis.
+
+        Args:
+            memory: ConversationMemory instance
+            user_text: The user's transcribed speech
+            on_sentence: Callback fired for each complete sentence
+
+        Returns:
+            LLMResult with full aggregated response and metrics
+        """
+        self._ensure_client()
+
+        memory.add_user_message(user_text)
+        messages = memory.get_messages()
+        context_info = memory.get_context_info()
+
+        t0 = time.perf_counter()
+        buffer = ""
+        full_text = ""
+        last_chunk = None
+        first_sentence_time: Optional[float] = None
+
+        try:
+            stream = self._client.chat(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                keep_alive="10m",
+            )
+
+            for chunk in stream:
+                token = chunk.message.content
+                buffer += token
+                full_text += token
+                last_chunk = chunk
+
+                # Check for sentence boundaries
+                if on_sentence is not None:
+                    parts = _SENTENCE_END.split(buffer)
+                    # If split produced >1 part, all but the last are complete sentences
+                    if len(parts) > 1:
+                        for sentence in parts[:-1]:
+                            sentence = sentence.strip()
+                            if len(sentence) >= _MIN_SENTENCE_CHARS:
+                                if first_sentence_time is None:
+                                    first_sentence_time = time.perf_counter()
+                                on_sentence(sentence)
+                        buffer = parts[-1]  # keep incomplete remainder
+
+        except Exception as e:
+            logger.error(f"Ollama streaming error: {e}")
+            if memory._history and memory._history[-1]["role"] == "user":
+                memory._history.pop()
+            raise
+
+        # Flush remaining buffer as final sentence
+        remaining = buffer.strip()
+        if remaining and on_sentence is not None:
+            if first_sentence_time is None:
+                first_sentence_time = time.perf_counter()
+            on_sentence(remaining)
+
+        processing_time_ms = (time.perf_counter() - t0) * 1000
+        response_text = full_text.strip()
+
+        # Extract token metrics from the final streaming chunk
+        eval_count = getattr(last_chunk, 'eval_count', 0) or 0
+        prompt_eval_count = getattr(last_chunk, 'prompt_eval_count', 0) or 0
+        eval_duration = getattr(last_chunk, 'eval_duration', 0) or 0
+
+        if eval_duration > 0:
+            tokens_per_second = eval_count / (eval_duration / 1e9)
+        elif processing_time_ms > 0:
+            tokens_per_second = eval_count / (processing_time_ms / 1000) if eval_count else 0
+        else:
+            tokens_per_second = 0
+
+        memory.add_assistant_message(response_text)
+
+        result = LLMResult(
+            text=response_text,
+            processing_time_ms=processing_time_ms,
+            token_count=eval_count,
+            prompt_token_count=prompt_eval_count,
+            tokens_per_second=tokens_per_second,
+            model_name=self.model,
+            context_tokens_used=context_info["context_tokens_used"],
+            turns_in_context=context_info["turns_in_context"],
+        )
+
+        ttfs_ms = (first_sentence_time - t0) * 1000 if first_sentence_time else processing_time_ms
+        logger.info(
+            f"LLM stream: '{response_text[:60]}...' | "
+            f"{processing_time_ms:.0f}ms total | "
+            f"TTFS={ttfs_ms:.0f}ms | "
+            f"{eval_count} tokens @ {tokens_per_second:.1f} tok/s"
         )
         return result
 

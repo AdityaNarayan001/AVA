@@ -49,6 +49,8 @@ class PipelineMetrics:
 
     # Total
     total_latency_ms: float = 0.0  # end-to-end: speech end → TTS audio ready
+    time_to_first_audio_ms: float = 0.0  # speech end → first TTS chunk playing (streaming)
+    tts_sentences: int = 0  # number of TTS chunks in streaming mode
 
     def compute_total(self):
         """Calculate total E2E latency from component latencies."""
@@ -176,10 +178,13 @@ class SessionMetrics:
             "",
             f"🔊 **TTS Latency:** {metrics.tts_latency_ms:.0f}ms | "
             f"Audio: {metrics.tts_audio_duration_ms:.0f}ms | "
-            f"RT Factor: {metrics.tts_realtime_factor:.1f}x",
+            f"RT Factor: {metrics.tts_realtime_factor:.1f}x"
+            + (f" | {metrics.tts_sentences} chunks" if metrics.tts_sentences > 1 else ""),
             "",
             f"{color_latency(metrics.total_latency_ms)} **Total E2E Latency:** "
-            f"{metrics.total_latency_ms:.0f}ms",
+            f"{metrics.total_latency_ms:.0f}ms"
+            + (f" | ⚡ **First Audio:** {metrics.time_to_first_audio_ms:.0f}ms"
+               if metrics.time_to_first_audio_ms > 0 else ""),
         ]
         return "\n".join(lines)
 
