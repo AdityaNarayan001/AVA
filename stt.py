@@ -99,33 +99,50 @@ class STTEngine:
         else:
             audio_float = audio.astype(np.float32)
 
+        # Sanitize: replace NaN/Inf, skip near-silent audio
+        audio_float = np.nan_to_num(audio_float, nan=0.0, posinf=1.0, neginf=-1.0)
+        audio_float = np.clip(audio_float, -1.0, 1.0)
+
+        rms = np.sqrt(np.mean(audio_float ** 2))
+        if rms < 1e-6 or np.all(audio_float == 0):
+            logger.info("STT: audio is silent, skipping transcription")
+            return STTResult(
+                text="",
+                language="en",
+                language_probability=1.0,
+                duration_seconds=duration_seconds,
+                processing_time_ms=0.0,
+                segments=[],
+            )
+
         # Write to temp WAV for faster-whisper
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
             sf.write(tmp.name, audio_float, sample_rate)
 
-            # Transcribe with timing
+            # Transcribe with timing (suppress mel-spectrogram edge-case warnings)
             t0 = time.perf_counter()
-            segments_iter, info = self.model.transcribe(
-                tmp.name,
-                beam_size=1,  # greedy for speed
-                best_of=1,
-                language="en",  # force English for speed (skip detection)
-                vad_filter=False,  # we already did VAD
-                without_timestamps=False,
-            )
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                segments_iter, info = self.model.transcribe(
+                    tmp.name,
+                    beam_size=1,  # greedy for speed
+                    best_of=1,
+                    language="en",  # force English for speed (skip detection)
+                    vad_filter=False,  # we already did VAD
+                    without_timestamps=False,
+                )
 
-            # Collect segments
-            segments = []
-            full_text_parts = []
-            for seg in segments_iter:
-                segments.append(STTSegment(
-                    text=seg.text.strip(),
-                    start=seg.start,
-                    end=seg.end,
-                    avg_logprob=seg.avg_logprob,
-                    no_speech_prob=seg.no_speech_prob,
-                ))
-                full_text_parts.append(seg.text.strip())
+                # Collect segments (iterator is lazy, so keep inside errstate)
+                segments = []
+                full_text_parts = []
+                for seg in segments_iter:
+                    segments.append(STTSegment(
+                        text=seg.text.strip(),
+                        start=seg.start,
+                        end=seg.end,
+                        avg_logprob=seg.avg_logprob,
+                        no_speech_prob=seg.no_speech_prob,
+                    ))
+                    full_text_parts.append(seg.text.strip())
 
             processing_time_ms = (time.perf_counter() - t0) * 1000
 

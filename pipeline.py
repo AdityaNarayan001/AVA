@@ -12,6 +12,8 @@ import queue
 import logging
 from typing import Optional, Callable, Tuple, List, Dict
 from dataclasses import dataclass
+from scipy.signal import resample_poly
+from math import gcd
 
 from vad import VADProcessor, VADResult
 from stt import STTEngine, STTResult
@@ -26,6 +28,22 @@ SAMPLE_RATE = 16000  # Mic / VAD / STT sample rate
 TTS_SAMPLE_RATE = 24000  # Kokoro output rate
 VAD_FRAME_MS = 32  # 32ms frames for VAD
 VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)  # 512 samples
+
+# Query native output device sample rate once at import
+try:
+    _OUTPUT_DEVICE_RATE = int(sd.query_devices(kind='output')['default_samplerate'])
+except Exception:
+    _OUTPUT_DEVICE_RATE = 48000
+
+
+def _safe_play(audio: np.ndarray, samplerate: int):
+    """Play audio, resampling to the device's native rate if needed."""
+    if samplerate != _OUTPUT_DEVICE_RATE:
+        g = gcd(samplerate, _OUTPUT_DEVICE_RATE)
+        audio = resample_poly(audio, _OUTPUT_DEVICE_RATE // g, samplerate // g).astype(np.float32)
+        samplerate = _OUTPUT_DEVICE_RATE
+    sd.play(audio, samplerate=samplerate)
+    sd.wait()
 
 # Silence detection: how many consecutive non-speech frames to end an utterance
 DEFAULT_SILENCE_TIMEOUT_MS = 1000
@@ -433,8 +451,7 @@ class VoicePipeline:
             if output.tts_result and output.tts_result.audio is not None:
                 self._playing = True
                 try:
-                    sd.play(output.tts_result.audio, samplerate=output.tts_result.sample_rate)
-                    sd.wait()  # Block until playback finishes
+                    _safe_play(output.tts_result.audio, output.tts_result.sample_rate)
                 except Exception as e:
                     logger.error(f"Audio playback error: {e}")
                 self._playing = False
