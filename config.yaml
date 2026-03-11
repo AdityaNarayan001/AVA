@@ -1,0 +1,89 @@
+# ═══════════════════════════════════════════════════════════════
+#  AVA — Voice AI Pipeline Configuration
+#  Edit this file to control all pipeline parameters at runtime.
+#  Changes take effect on next restart (or hot-reload where noted).
+# ═══════════════════════════════════════════════════════════════
+
+# ── LLM Backend ──────────────────────────────────────────────
+# Switch between "ollama" (local) and "openai_compatible" (remote API).
+llm:
+  backend: "openai_compatible"                      # "ollama" | "openai_compatible"
+
+  # ── Ollama settings (used when backend == "ollama") ────────
+  ollama:
+    model: "smollm2:135m"                # Any Ollama model tag
+    host: "http://localhost:11434"        # Ollama server URL
+    keep_alive: "10m"                     # How long to keep model hot in RAM
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    num_ctx: 2048                         # Model context window size
+    repeat_penalty: 1.1
+
+  # ── OpenAI-compatible API (used when backend == "openai_compatible")
+  # Works with any API that speaks the OpenAI / Anthropic messages format:
+  #   Juspay Grid, OpenRouter, Together, vLLM, llama.cpp server, etc.
+  openai_compatible:
+    base_url: "https://grid.ai.juspay.net/v1"
+    api_key: "${AVA_API_KEY}"             # Loaded from .env file
+    model: "kimi-latest"
+    max_tokens: 256
+    temperature: 0.7
+    top_p: 0.9
+    extra_headers:                        # Any additional HTTP headers
+      x-api-key: "${AVA_API_KEY}"         # Juspay Grid uses x-api-key
+    timeout: 30                           # Request timeout in seconds
+
+# ── STT (Speech-to-Text) ────────────────────────────────────
+stt:
+  model_size: "tiny"                     # "tiny" | "base" | "small" | "medium" | "large-v3"
+  device: "cpu"                          # "cpu" | "cuda" | "auto"
+  compute_type: "int8"                   # "int8" | "float16" | "float32"
+  language: "en"                         # Force language or "auto" for detection
+  beam_size: 1                           # 1 = greedy (fast), 5 = beam search (accurate)
+  vad_filter: false                      # Use whisper's built-in VAD (we have our own)
+
+# ── TTS (Text-to-Speech) ────────────────────────────────────
+tts:
+  voice: "af_heart"                      # Default voice
+  speed: 1.0                             # Playback speed multiplier
+  language: "en-us"                      # Phonemizer language
+  model_path: "models/kokoro-v1.0.onnx"
+  voices_path: "models/voices-v1.0.bin"
+
+# ── VAD (Voice Activity Detection) ──────────────────────────
+vad:
+  threshold: 0.5                         # Speech probability threshold (0.0 - 1.0)
+  silence_timeout_ms: 1000               # Silence duration to end an utterance
+  min_speech_ms: 500                     # Minimum speech duration to process
+  frame_ms: 32                           # Frame size in milliseconds
+  backend: "auto"                        # "auto" | "ten_vad" | "silero"
+
+# ── Memory / Context Window ─────────────────────────────────
+memory:
+  enabled: true                          # true = multi-turn, false = single-turn
+  max_context_tokens: 1500               # Token budget for conversation history
+  tokens_per_word: 1.3                   # Heuristic for token estimation
+  system_prompt: >
+    You are AVA, a helpful and concise voice assistant running on a small device.
+    Keep your responses short, natural, and conversational — typically 1-3 sentences.
+    Speak in plain language. No markdown, no bullet points, no numbered lists.
+    If you don't know something, say so briefly.
+
+# ── Streaming / Sentence Chunking ───────────────────────────
+streaming:
+  enabled: true                          # Stream LLM tokens + sentence-chunked TTS
+  min_sentence_chars: 12                 # Minimum chars before flushing a sentence
+  sentence_pattern: '(?<=[.!?])\s+'      # Regex for sentence boundary detection
+
+# ── Audio I/O ───────────────────────────────────────────────
+audio:
+  input_sample_rate: 16000               # Mic / VAD / STT sample rate (don't change)
+  tts_sample_rate: 24000                 # Kokoro output rate (don't change)
+  output_device_rate: "auto"             # "auto" detects native rate, or set e.g. 48000
+
+# ── Logging ─────────────────────────────────────────────────
+logging:
+  level: "WARNING"                       # "DEBUG" | "INFO" | "WARNING" | "ERROR"
+  file: "ava.log"
+  file_level: "DEBUG"                    # Log level for the file handler

@@ -9,8 +9,12 @@ import logging
 import json
 import time
 
+from config import get_config
+
 logger = logging.getLogger(__name__)
 
+# DEFAULT_SYSTEM_PROMPT kept as importable constant for backward compat,
+# but the actual prompt is read from config.yaml at runtime.
 DEFAULT_SYSTEM_PROMPT = (
     "You are AVA, a helpful and concise voice assistant running on a small device. "
     "Keep your responses short, natural, and conversational — typically 1-3 sentences. "
@@ -30,18 +34,19 @@ class ConversationMemory:
 
     def __init__(
         self,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-        max_context_tokens: int = 1500,
-        tokens_per_word: float = 1.3,
+        system_prompt: str = None,
+        max_context_tokens: int = None,
+        tokens_per_word: float = None,
     ):
-        self.system_prompt = system_prompt
-        self.max_context_tokens = max_context_tokens
-        self.tokens_per_word = tokens_per_word
+        cfg = get_config().memory
+        self.system_prompt = system_prompt or cfg.system_prompt
+        self.max_context_tokens = max_context_tokens or cfg.max_context_tokens
+        self.tokens_per_word = tokens_per_word or cfg.tokens_per_word
         self._history: List[Dict[str, str]] = []  # Full untruncated history
         self._created_at = time.time()
         logger.info(
-            f"ConversationMemory initialized: max_tokens={max_context_tokens}, "
-            f"system_prompt={len(system_prompt)} chars"
+            f"ConversationMemory initialized: max_tokens={self.max_context_tokens}, "
+            f"system_prompt={len(self.system_prompt)} chars"
         )
 
     def _estimate_tokens(self, text: str) -> int:

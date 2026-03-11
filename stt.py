@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import logging
 
+from config import get_config
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
@@ -48,13 +50,17 @@ class STTEngine:
     Optimized for low-latency CPU inference on macOS.
     """
 
-    def __init__(self, model_size: str = "tiny", device: str = "cpu", compute_type: str = "int8"):
-        self.model_size = model_size
-        self.device = device
-        self.compute_type = compute_type
+    def __init__(self, model_size: str = None, device: str = None, compute_type: str = None):
+        cfg = get_config().stt
+        self.model_size = model_size or cfg.model_size
+        self.device = device or cfg.device
+        self.compute_type = compute_type or cfg.compute_type
+        self._language = cfg.language
+        self._beam_size = cfg.beam_size
+        self._vad_filter = cfg.vad_filter
         self.model = None
         self._loaded = False
-        logger.info(f"STT engine configured: model={model_size}, device={device}, compute_type={compute_type}")
+        logger.info(f"STT engine configured: model={self.model_size}, device={self.device}, compute_type={self.compute_type}")
 
     def load(self):
         """Load the whisper model. Call once at startup."""
@@ -115,13 +121,14 @@ class STTEngine:
 
         # Pass numpy array directly to faster-whisper (no temp file I/O)
         t0 = time.perf_counter()
+        lang = self._language if self._language != "auto" else None
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             segments_iter, info = self.model.transcribe(
                 audio_float,
-                beam_size=1,  # greedy for speed
+                beam_size=self._beam_size,
                 best_of=1,
-                language="en",  # force English for speed (skip detection)
-                vad_filter=False,  # we already did VAD
+                language=lang,
+                vad_filter=self._vad_filter,
                 without_timestamps=False,
             )
 

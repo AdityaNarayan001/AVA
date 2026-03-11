@@ -9,12 +9,14 @@ import sounddevice as sd
 import time
 import threading
 import queue
+import collections
 import logging
 from typing import Optional, Callable, Tuple, List, Dict
 from dataclasses import dataclass
 from scipy.signal import resample_poly
 from math import gcd
 
+from config import get_config
 from vad import VADProcessor, VADResult
 from stt import STTEngine, STTResult
 from llm import LLMEngine, LLMResult
@@ -24,10 +26,12 @@ from metrics import PipelineMetrics, SessionMetrics
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000  # Mic / VAD / STT sample rate
-TTS_SAMPLE_RATE = 24000  # Kokoro output rate
-VAD_FRAME_MS = 32  # 32ms frames for VAD
-VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)  # 512 samples
+_cfg = get_config()
+
+SAMPLE_RATE = _cfg.audio.input_sample_rate
+TTS_SAMPLE_RATE = _cfg.audio.tts_sample_rate
+VAD_FRAME_MS = _cfg.vad.frame_ms
+VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
 
 # Query native output device sample rate once at import
 try:
@@ -48,10 +52,10 @@ def _safe_play(audio: np.ndarray, samplerate: int):
     sd.play(audio, samplerate=samplerate)
     sd.wait()
 
-# Silence detection: how many consecutive non-speech frames to end an utterance
-DEFAULT_SILENCE_TIMEOUT_MS = 1000
-DEFAULT_MIN_SPEECH_MS = 500
-DEFAULT_VAD_THRESHOLD = 0.5
+# Silence detection defaults (from config)
+DEFAULT_SILENCE_TIMEOUT_MS = _cfg.vad.silence_timeout_ms
+DEFAULT_MIN_SPEECH_MS = _cfg.vad.min_speech_ms
+DEFAULT_VAD_THRESHOLD = _cfg.vad.threshold
 
 
 @dataclass
@@ -79,7 +83,11 @@ class VoicePipeline:
         self.tts: Optional[TTSEngine] = None
 
         # Memory
-        self.memory: ConversationMemory = ConversationMemory()
+        cfg_mem = get_config().memory
+        if cfg_mem.enabled:
+            self.memory: ConversationMemory = ConversationMemory()
+        else:
+            self.memory: ConversationMemory = StatelessMemory()
 
         # Metrics
         self.session_metrics = SessionMetrics()
@@ -104,6 +112,8 @@ class VoicePipeline:
         # Continuous listening
         self._mic_stream: Optional[sd.InputStream] = None
         self._process_thread: Optional[threading.Thread] = None
+        self._vad_thread: Optional[threading.Thread] = None
+        self._audio_ring: collections.deque = collections.deque(maxlen=2000)
         self._utterance_queue: queue.Queue = queue.Queue()
 
         # Shared UI state (read by Gradio timer, written by pipeline threads)
@@ -141,7 +151,7 @@ class VoicePipeline:
 
         # STT and TTS model loads are independent — run in parallel
         self._set_status("loading_models")
-        self.stt = STTEngine(model_size="tiny", device="cpu", compute_type="int8")
+        self.stt = STTEngine()
         self.tts = TTSEngine()
 
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ava-load") as pool:
@@ -369,7 +379,13 @@ class VoicePipeline:
         )
         self._process_thread.start()
 
-        # Start the mic stream
+        # Start the VAD thread (drains audio ring → runs VAD outside cffi context)
+        self._vad_thread = threading.Thread(
+            target=self._vad_loop, daemon=True, name="ava-vad"
+        )
+        self._vad_thread.start()
+
+        # Start the mic stream — callback ONLY copies data into the ring buffer
         self._mic_stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -406,73 +422,97 @@ class VoicePipeline:
             self._process_thread.join(timeout=5)
         self._process_thread = None
 
+        # Wait for VAD thread
+        if self._vad_thread and self._vad_thread.is_alive():
+            self._vad_thread.join(timeout=3)
+        self._vad_thread = None
+
         self.reset_audio_state()
         self._set_status("idle")
         logger.info("Listening stopped")
 
     def _mic_callback(self, indata, frames, time_info, status):
         """
-        Called by sounddevice for every audio block from the mic.
-        Feeds audio into the VAD and detects utterance boundaries.
-        Runs in the audio thread — must be fast, no blocking.
+        Called by sounddevice (PortAudio cffi) for every audio block.
+        MUST be minimal — only copy data to the ring buffer.
+        Heavy work (VAD) lives in _vad_loop to avoid cffi callback crashes.
         """
         if status:
-            logger.warning(f"Mic status: {status}")
-        if not self._running:
-            return
+            # cannot use logger inside cffi; deferred ring-side logging is fine
+            pass
+        if self._running:
+            self._audio_ring.append(indata[:, 0].copy())
 
-        audio_chunk = indata[:, 0].copy()  # mono int16
+    def _vad_loop(self):
+        """
+        Drains audio from the ring buffer and runs VAD processing
+        in a pure-Python thread (safe from cffi callback restrictions).
+        """
+        logger.info("VAD processing thread started")
+        while self._running:
+            # Drain all available chunks (non-blocking)
+            chunks = []
+            try:
+                while True:
+                    chunks.append(self._audio_ring.popleft())
+            except IndexError:
+                pass  # deque empty
 
-        # Always run VAD so the confidence meter stays alive,
-        # but only buffer speech when we're not already processing/playing.
-        try:
-            for i in range(0, len(audio_chunk), VAD_FRAME_SAMPLES):
-                frame = audio_chunk[i:i + VAD_FRAME_SAMPLES]
-                if len(frame) < VAD_FRAME_SAMPLES:
-                    frame = np.pad(frame, (0, VAD_FRAME_SAMPLES - len(frame)))
+            if not chunks:
+                time.sleep(0.005)  # ~5 ms idle poll
+                continue
 
-                vad_result = self.vad.process(frame)
-                self._last_vad_confidence = vad_result.confidence
+            for audio_chunk in chunks:
+                try:
+                    for i in range(0, len(audio_chunk), VAD_FRAME_SAMPLES):
+                        frame = audio_chunk[i:i + VAD_FRAME_SAMPLES]
+                        if len(frame) < VAD_FRAME_SAMPLES:
+                            frame = np.pad(frame, (0, VAD_FRAME_SAMPLES - len(frame)))
 
-                # Skip speech buffering while processing or playing
-                if self._processing or self._playing:
-                    continue
+                        vad_result = self.vad.process(frame)
+                        self._last_vad_confidence = vad_result.confidence
 
-                if vad_result.is_speech:
-                    if not self._is_speaking:
-                        self._is_speaking = True
-                        self._speech_start_time = time.perf_counter()
-                        self._speech_buffer = []
-                        self._set_status("speech_detected")
-                    self._speech_buffer.append(frame.copy())
-                    self._silence_frames = 0
+                        # Skip speech buffering while processing or playing
+                        if self._processing or self._playing:
+                            continue
 
-                elif self._is_speaking:
-                    self._silence_frames += 1
-                    self._speech_buffer.append(frame.copy())
+                        if vad_result.is_speech:
+                            if not self._is_speaking:
+                                self._is_speaking = True
+                                self._speech_start_time = time.perf_counter()
+                                self._speech_buffer = []
+                                self._set_status("speech_detected")
+                            self._speech_buffer.append(frame.copy())
+                            self._silence_frames = 0
 
-                    silence_ms = self._silence_frames * VAD_FRAME_MS
-                    if silence_ms >= self.silence_timeout_ms:
-                        speech_duration_ms = len(self._speech_buffer) * VAD_FRAME_MS
-                        if speech_duration_ms >= self.min_speech_ms:
-                            completed = np.concatenate(self._speech_buffer)
-                            self._utterance_queue.put(completed)
-                            logger.info(f"Utterance queued: {speech_duration_ms:.0f}ms")
-                        else:
-                            logger.debug(f"Rejected short utterance: {speech_duration_ms:.0f}ms")
+                        elif self._is_speaking:
+                            self._silence_frames += 1
+                            self._speech_buffer.append(frame.copy())
 
-                        self._is_speaking = False
-                        self._speech_buffer = []
-                        self._silence_frames = 0
-                        try:
-                            self.vad.reset()
-                        except Exception:
-                            pass
-                        if not self._processing:
-                            self._set_status("listening")
+                            silence_ms = self._silence_frames * VAD_FRAME_MS
+                            if silence_ms >= self.silence_timeout_ms:
+                                speech_duration_ms = len(self._speech_buffer) * VAD_FRAME_MS
+                                if speech_duration_ms >= self.min_speech_ms:
+                                    completed = np.concatenate(self._speech_buffer)
+                                    self._utterance_queue.put(completed)
+                                    logger.info(f"Utterance queued: {speech_duration_ms:.0f}ms")
+                                else:
+                                    logger.debug(f"Rejected short utterance: {speech_duration_ms:.0f}ms")
 
-        except Exception as e:
-            logger.error(f"Mic callback error: {e}", exc_info=True)
+                                self._is_speaking = False
+                                self._speech_buffer = []
+                                self._silence_frames = 0
+                                try:
+                                    self.vad.reset()
+                                except Exception:
+                                    pass
+                                if not self._processing:
+                                    self._set_status("listening")
+
+                except Exception as e:
+                    logger.error(f"VAD loop error: {e}", exc_info=True)
+
+        logger.info("VAD processing thread stopped")
 
     def _processing_loop(self):
         """
