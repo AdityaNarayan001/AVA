@@ -1,10 +1,10 @@
-# AVA — Real-Time Local Voice AI Pipeline
+# AVA — Real-Time Voice AI Pipeline
 
-A fully local, real-time voice assistant pipeline for testing IoT voice AI stacks on your laptop before deploying to hardware.
+A real-time voice assistant pipeline for testing IoT voice AI stacks on your laptop before deploying to hardware.
 
-**Pipeline:** Mic → TEN VAD → faster-whisper (STT) → smollm2:135m (LLM) → kokoro-onnx (TTS) → Speaker
+**Pipeline:** Mic → TEN VAD → faster-whisper (STT) → LLM → kokoro-onnx (TTS) → Speaker
 
-No cloud APIs. No internet required at runtime. Just talk — AVA detects your voice, transcribes, thinks, and replies through your speakers automatically.
+Supports **fully local** inference (Ollama) or **cloud LLM** APIs (OpenAI, Juspay Grid, OpenRouter, Together, etc.) — switchable via one line in `config.yaml`.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -15,11 +15,13 @@ No cloud APIs. No internet required at runtime. Just talk — AVA detects your v
 ## Features
 
 - **Hands-free conversation** — continuous mic listening with VAD-based turn detection
-- **Fully local** — every component runs on-device, no network calls
-- **Real-time metrics** — per-turn latency breakdown (STT / LLM / TTS / E2E), session-level aggregates (avg, min, max, p95)
-- **Live transcription** — see exactly what the STT model heard
+- **Local or cloud LLM** — Ollama for offline, or any OpenAI-compatible API via config
+- **Streaming pipeline** — LLM streams tokens → sentence-chunked TTS for low time-to-first-audio
+- **Two UIs** — Cyberpunk terminal TUI (`terminal_app.py`) + Gradio web UI (`app.py`)
+- **Real-time metrics** — per-turn latency breakdown (STT / LLM / TTS / E2E), session aggregates
 - **Conversation memory** — sliding-window context management within the LLM's token budget
-- **Configurable** — swap voices, models, VAD sensitivity, memory settings from the UI
+- **Fully configurable** — `config.yaml` controls every parameter; secrets in `.env` (git-safe)
+- **One-click setup** — `setup.sh` handles everything: backend choice, API keys, deps, models
 - **IoT-oriented** — small models chosen to represent edge deployment constraints
 
 ---
@@ -57,17 +59,16 @@ No cloud APIs. No internet required at runtime. Just talk — AVA detects your v
 ### Threading Model
 
 ```
-Audio Thread (sounddevice)          Processing Thread (daemon)       Main Thread (Gradio)
-┌──────────────────────┐           ┌──────────────────────┐        ┌──────────────────┐
-│ _mic_callback()      │           │ _processing_loop()   │        │ gr.Timer (500ms) │
-│                      │           │                      │        │                  │
-│ For each 32ms frame: │  queue    │ Dequeue utterance     │ shared │ poll_ui_updates()│
-│  ├─ VAD.process()    │─────────▶│  ├─ STT.transcribe() │──state─▶│  ├─ get_snapshot│
-│  ├─ Update confidence│ (speech)  │  ├─ LLM.generate()   │ (lock) │  ├─ Update chat │
-│  ├─ Buffer speech    │           │  ├─ TTS.synthesize()  │        │  ├─ Update VAD  │
-│  └─ Detect silence   │           │  ├─ sd.play() + wait │        │  └─ Update stats│
-│     → enqueue        │           │  └─ Update UI state   │        │                  │
-└──────────────────────┘           └──────────────────────┘        └──────────────────┘
+Audio Thread (sounddevice)     VAD Thread (daemon)             Processing Thread (daemon)
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│ _mic_callback()      │    │ _vad_loop()          │    │ _processing_loop()   │
+│                      │    │                      │    │                      │
+│ Copy audio to ring   │ring│ Drain ring buffer    │ q  │ Dequeue utterance    │
+│ buffer (minimal,     │───▶│ VAD.process() frames │───▶│  ├─ STT.transcribe() │
+│ cffi-safe)           │    │ Buffer speech        │    │  ├─ LLM.generate()   │
+│                      │    │ Detect silence       │    │  ├─ TTS.synthesize() │
+│                      │    │  → enqueue utterance │    │  └─ sd.play() + wait │
+└──────────────────────┘    └──────────────────────┘    └──────────────────────┘
 ```
 
 ---
@@ -119,14 +120,14 @@ Audio Thread (sounddevice)          Processing Thread (daemon)       Main Thread
 
 | Property | Value |
 |---|---|
-| **Runtime** | [Ollama](https://ollama.com) (local inference server) |
-| **Default model** | `smollm2:135m` — 135M parameters, ~270MB |
-| **Alternative models** | `smollm2:360m`, `smollm2:1.7b` (selectable in UI) |
-| **Context window** | ~2048 tokens |
-| **API** | `ollama.Client().chat(model, messages)` |
-| **Token metrics** | Extracted from Ollama response: `eval_count`, `prompt_eval_count`, `eval_duration` |
+| **Backend A** | [Ollama](https://ollama.com) — local inference |
+| **Backend B** | OpenAI-compatible API — Juspay Grid, OpenRouter, Together, vLLM, etc. |
+| **Default model (local)** | `smollm2:135m` — 135M parameters, ~270MB |
+| **Default model (cloud)** | Configurable in `config.yaml` |
+| **Streaming** | Yes — tokens stream to sentence chunker for overlapped TTS |
+| **Selection** | `config.yaml` → `llm.backend`: `"ollama"` or `"openai_compatible"` |
 
-**How it works:** The STT text is added to conversation memory. The memory module builds a message list (system prompt + sliding window of history) that fits within the token budget. This is sent to Ollama's chat API. The response text and token metrics are captured. If the Ollama call fails, the user message is rolled back from memory.
+**How it works:** The STT text is added to conversation memory. The memory module builds a message list (system prompt + sliding window of history) that fits within the token budget. This is sent to the active LLM backend. For Ollama, it uses the native Python client. For cloud APIs, it sends raw HTTP with SSE streaming and auto-detects OpenAI vs Anthropic response formats. Sentence boundaries are detected in the token stream and each sentence is immediately dispatched to TTS.
 
 ---
 
@@ -212,30 +213,43 @@ STT 15% | LLM 60% | TTS 25%
 ### Prerequisites
 
 - **Python 3.10+**
-- **Ollama** — [Install Ollama](https://ollama.com/download)
-- **espeak-ng** — Required by kokoro-onnx for phonemization
+- **espeak-ng** — Required by kokoro-onnx for phonemization (setup.sh installs it)
 
-### Quick Setup
+### Quick Setup (Recommended)
+
+The setup script is interactive — it asks you to choose your LLM backend and handles everything:
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/ava-voice-pipeline.git
-cd ava-voice-pipeline
+git clone https://github.com/AdityaNarayan001/AVA.git
+cd AVA
 
-# Run the setup script (installs everything)
+# Run the setup script
 chmod +x setup.sh
 ./setup.sh
 ```
+
+**What setup.sh does:**
+1. Asks you to choose **Ollama** (local) or **LiteLLM** (cloud API)
+2. If Ollama → installs it, starts the server, pulls a model
+3. If LiteLLM → asks for your API key, writes `.env`
+4. Updates `config.yaml` with your choice
+5. Installs espeak-ng if missing
+6. Creates `.venv` and installs all Python dependencies
+7. Downloads TTS models (~340 MB) from HuggingFace
+8. Verifies everything works
+
+> **Switching later:** Just edit `config.yaml` → `llm.backend` to `"ollama"` or `"openai_compatible"` and restart.
 
 ### Manual Setup
 
 ```bash
 # 1. Install system dependencies
-brew install ollama espeak-ng   # macOS
-# sudo apt install espeak-ng    # Linux
+brew install espeak-ng           # macOS
+# sudo apt install espeak-ng     # Linux
 
-# 2. Pull the LLM model
-ollama pull smollm2:135m
+# 2. (Optional) Install Ollama for local LLM
+brew install ollama && ollama pull smollm2:135m
 
 # 3. Create virtual environment
 python3 -m venv .venv
@@ -243,42 +257,34 @@ source .venv/bin/activate
 
 # 4. Install Python dependencies
 pip install -r requirements.txt
-pip install -U git+https://github.com/TEN-framework/ten-vad.git  # TEN VAD (optional — Silero fallback)
+pip install -U git+https://github.com/TEN-framework/ten-vad.git
 
-# 5. Download TTS models (first run does this automatically, or manually):
+# 5. Download TTS models
 mkdir -p models
-# kokoro-v1.0.onnx (~310MB) and voices-v1.0.bin (~27MB) are downloaded on first TTS use
-```
+curl -L -o models/kokoro-v1.0.onnx https://huggingface.co/hexgrad/Kokoro-82M-v1.0-ONNX/resolve/main/kokoro-v1.0.onnx
+curl -L -o models/voices-v1.0.bin  https://huggingface.co/hexgrad/Kokoro-82M-v1.0-ONNX/resolve/main/voices-v1.0.bin
 
-### Verify Installation
-
-```bash
-source .venv/bin/activate
-python -c "
-import sounddevice, faster_whisper, ollama, kokoro_onnx, gradio
-print('All core imports OK')
-try:
-    import ten_vad; print('TEN VAD: OK')
-except: print('TEN VAD: not available (Silero fallback will be used)')
-"
+# 6. Create .env for API keys (if using cloud LLM)
+echo 'AVA_API_KEY=your-key-here' > .env
 ```
 
 ---
 
 ## Usage
 
-### Start the App
+### Start AVA
 
 ```bash
-# Make sure Ollama is running
-ollama serve &   # if not already running
-
-# Activate environment and launch
 source .venv/bin/activate
-python app.py
+
+# Terminal UI (recommended)
+python terminal_app.py
+
+# Or Gradio Web UI
+python app.py              # opens http://localhost:7860
 ```
 
-Open **http://localhost:7860** in your browser.
+If using Ollama, make sure the server is running: `ollama serve &`
 
 ### How to Use
 
@@ -306,19 +312,23 @@ This tests mic capture, checks audio levels, and verifies VAD is detecting speec
 ## Project Structure
 
 ```
-ava-voice-pipeline/
-├── app.py              # Gradio web UI — real-time polling, controls, settings
-├── pipeline.py         # Main orchestrator — mic, VAD, STT, LLM, TTS, playback
+AVA/
+├── config.yaml         # All pipeline parameters (backend, models, thresholds)
+├── config.py           # Typed config loader with .env resolution
+├── .env                # API keys (git-ignored, created by setup.sh)
+├── pipeline.py         # Main orchestrator — mic → VAD → STT → LLM → TTS → speaker
 ├── vad.py              # Voice Activity Detection (TEN VAD + Silero fallback)
-├── stt.py              # Speech-to-Text (faster-whisper tiny)
-├── llm.py              # LLM inference (Ollama + smollm2)
+├── stt.py              # Speech-to-Text (faster-whisper)
+├── llm.py              # LLM engine (Ollama local + OpenAI-compatible cloud)
 ├── tts.py              # Text-to-Speech (kokoro-onnx)
 ├── memory.py           # Conversation memory with sliding window
 ├── metrics.py          # Per-turn and session-level metrics
+├── terminal_app.py     # Cyberpunk terminal UI (Rich)
+├── app.py              # Gradio web UI
 ├── test_mic.py         # Mic + VAD diagnostic tool
-├── setup.sh            # One-command setup script
+├── setup.sh            # Interactive one-command setup
 ├── requirements.txt    # Python dependencies
-└── models/             # Downloaded model files
+└── models/             # Downloaded model files (git-ignored)
     ├── kokoro-v1.0.onnx    # TTS model (~310MB)
     └── voices-v1.0.bin     # TTS voice data (~27MB)
 ```
@@ -327,7 +337,23 @@ ava-voice-pipeline/
 
 ## Configuration Reference
 
-All settings are adjustable from the Gradio UI's Settings panel.
+All settings live in `config.yaml`. Secrets use `${VAR}` placeholders resolved from `.env`.
+
+### LLM Backend
+
+```yaml
+llm:
+  backend: "ollama"             # "ollama" or "openai_compatible"
+  ollama:
+    model: "smollm2:135m"       # Any Ollama model tag
+    host: "http://localhost:11434"
+  openai_compatible:
+    base_url: "https://grid.ai.juspay.net/v1"
+    api_key: "${AVA_API_KEY}"   # Resolved from .env
+    model: "kimi-latest"
+```
+
+### Pipeline Settings
 
 | Setting | Default | Range | Description |
 |---|---|---|---|
@@ -392,7 +418,8 @@ All settings are adjustable from the Gradio UI's Settings panel.
 | Port 7860 in use | `lsof -ti:7860 \| xargs kill -9` then retry |
 | VAD meter stays at 0 | Run `python test_mic.py` — check mic permissions |
 | No audio output | Check system volume and default output device |
-| Ollama connection error | Make sure `ollama serve` is running |
+| Ollama connection error | Make sure `ollama serve` is running (only needed for Ollama backend) |
+| Cloud LLM timeout | Check API key in `.env` and `base_url` in `config.yaml` |
 | espeak-ng not found | `brew install espeak-ng` (macOS) or `apt install espeak-ng` (Linux) |
 | TEN VAD fails to load | Silero VAD auto-fallback activates; check terminal logs |
 | Slow first response | Model loading on first use — subsequent turns are faster |

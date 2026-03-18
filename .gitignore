@@ -3,3 +3,5 @@ models/
 logs/
 __pycache__/
 ava.log
+.env
+reads.txt

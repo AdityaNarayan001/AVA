@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from typing import Optional
 import logging
 
+from config import get_config
+
 logger = logging.getLogger(__name__)
 
+# Defaults (overridden by config.yaml)
 DEFAULT_VOICE = "af_heart"
 OUTPUT_SAMPLE_RATE = 24000
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -37,12 +40,17 @@ class TTSEngine:
     Produces 24kHz audio from text input.
     """
 
-    def __init__(self, voice: str = DEFAULT_VOICE):
-        self.voice = voice
+    def __init__(self, voice: str = None):
+        cfg = get_config().tts
+        self.voice = voice or cfg.voice
+        self._speed = cfg.speed
+        self._language = cfg.language
+        self._model_path = cfg.model_path if os.path.isabs(cfg.model_path) else MODEL_PATH
+        self._voices_path = cfg.voices_path if os.path.isabs(cfg.voices_path) else VOICES_PATH
         self.sample_rate = OUTPUT_SAMPLE_RATE
         self._model = None
         self._loaded = False
-        logger.info(f"TTS engine configured: voice={voice}")
+        logger.info(f"TTS engine configured: voice={self.voice}, speed={self._speed}")
 
     def load(self):
         """Load the kokoro-onnx model. Call once at startup."""
@@ -51,7 +59,7 @@ class TTSEngine:
         from kokoro_onnx import Kokoro
         logger.info("Loading kokoro-onnx model...")
         t0 = time.perf_counter()
-        self._model = Kokoro(MODEL_PATH, VOICES_PATH)
+        self._model = Kokoro(self._model_path, self._voices_path)
         load_time = (time.perf_counter() - t0) * 1000
         self._loaded = True
         logger.info(f"TTS model loaded in {load_time:.0f}ms")
@@ -89,8 +97,8 @@ class TTSEngine:
         samples, sample_rate = self._model.create(
             text,
             voice=use_voice,
-            speed=1.0,
-            lang="en-us",
+            speed=self._speed,
+            lang=self._language,
         )
         processing_time_ms = (time.perf_counter() - t0) * 1000
 
