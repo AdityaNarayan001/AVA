@@ -7,11 +7,11 @@
 # ── LLM Backend ──────────────────────────────────────────────
 # Switch between "ollama" (local) and "openai_compatible" (remote API).
 llm:
-  backend: "openai_compatible"                      # "ollama" | "openai_compatible"
+  backend: "ollama"                      # "ollama" | "openai_compatible"
 
   # ── Ollama settings (used when backend == "ollama") ────────
   ollama:
-    model: "smollm2:135m"                # Any Ollama model tag
+    model: "smollm2:135m"                # Any Ollama model tag  #qwen3.5:9b #smollm2:135m
     host: "http://localhost:11434"        # Ollama server URL
     keep_alive: "10m"                     # How long to keep model hot in RAM
     temperature: 0.7
